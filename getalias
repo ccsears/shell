@@ -1,0 +1,38 @@
+#!/usr/bin/ksh
+load_aliases() {
+   while read line
+   do
+      echo $line | egrep "^#" >/dev/null 2>&1
+      if [[ $? -eq 0 ]]; then
+         continue
+      fi
+      alias=`echo $line | cut -d':' -f1`
+      actual=`echo $line | cut -d':' -f2 |cut -c2-`
+      eval "export $alias=\"$actual\""
+   done < /siebelap/javaIntegration/beep/NOTIFY/monaliases
+}      
+get_alias() {
+      if [ "$1" = "" ]; then
+         echo "$1 \c"
+         return
+      fi
+      eval "env $1" >/dev/null 2>&1
+      if [[ $? -ne 0 ]]; then 
+         echo "$1 \c"
+         return
+      fi
+      for each in `eval "env $1"`
+      do
+         env $each >/dev/null 2>&1
+         if [[ $? -eq 0 ]]; then
+            echo `eval "env $each"`|grep "@" >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                eval "echo \"\$$each \c"
+            else
+                get_alias $each
+            fi
+         else
+             echo "$each \c"
+         fi
+      done      
+}
