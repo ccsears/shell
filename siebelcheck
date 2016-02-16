@@ -1,0 +1,433 @@
+#!/bin/ksh
+export INFRAJNL=/tmp/beep.jnl
+DIR=/siebelap/javaIntegration/beep/SIEBEL
+
+. /home/siebel/.profile
+. /home/siebinst/sqllib/db2profile
+. /siebelap/siebsrvr/siebenv.sh
+. /siebelap/javaIntegration/beep/infrastat.sh
+
+#####   Start function definitions   #####
+
+##################################
+#  Send message to pager or e-mail
+##################################
+notify1()
+{
+   message="$1"
+   subject="$2"
+   addressee="$3"
+   cclist="$4"
+
+#   if [[ ! -a /tmp/beep.Scontrol."$subject" ]]; then
+     notify "$subject" "$addressee" "$cclist" "$message"
+#     echo "$subject down" > /tmp/beep.Scontrol."$subject"
+#   fi 
+#   echo "$message"|mailx -s "$subject" "$addressee"
+#    echo "$message"|/cars/mutt/bin/mutt -e "set envelope_from=yes"  -e "my_hdr From: operator <operator@gm.com>" -s "$subject" "$addressee"
+    return
+}
+
+#########################################
+#  Check to see if should check component
+#########################################
+parmcheck()
+{
+   if [ "$dow" = "*" ]; then
+      #echo dow is wildcard
+      daycheck=true
+   else
+      #echo dow is $dow
+      rangecheck $curdow $dow
+      if [ $? -gt 0 ]; then
+         daycheck=false
+      else
+         daycheck=true
+      fi
+   fi
+
+   if [ "$hour" = "*" ]; then
+      #echo hour is wildcard
+      hourcheck=true
+   else
+      #echo hour is $hour
+      rangecheck $curhour $hour
+      if [ $? -gt 0 ]; then
+         hourcheck=false
+      else
+         hourcheck=true
+      fi
+   fi
+}
+
+rangecheck()
+{
+   curval=$1
+   range=$2
+   
+   if [ $curval -eq $range ]; then
+      #echo single - equals!
+      return 0;
+   else
+      rangelo=`echo $range|cut -d'-' -f1`
+      rangehi=`echo $range|cut -d'-' -f2`
+      if [ $curval -ge $rangelo -a $curval -le $rangehi ]; then
+         #echo Range -in bounds
+         return 0;
+      else 
+         #echo Range -out of bounds
+         return 1;
+      fi
+   fi  
+}
+
+##########################
+#  SRVRMGR checking
+##########################
+SRVRMGR_FN()
+{
+   echo Checking for $occur occurrences of $comp"\c" 
+# and index of 2 means a task can be Online or Running
+   if [ $index -eq 2 ]; then
+     compcount=`grep -we "$comp" $DIR/allthings|grep -cE "Online|Running"`
+     if [ $compcount -$cond $occur ]; then
+        echo "... Online"
+     else 
+        echo "... NOT Online:  $compcount occurrences should be $cond $occur"
+        echo I need to page $who
+        notify1 "$comp NOT Online!  $compcount occurrences should be $cond $occur"  "$comp" "$who"
+     fi
+   else
+# and index of 1 means a task can only be Running
+     compcount=`grep -we "$comp" $DIR/allthings|grep -c Running`
+     if [ $compcount -$cond $occur ]; then
+        echo "... Running"
+     else 
+        echo "... NOT Running:  $compcount occurrences should be $cond $occur"
+        echo I need to page $who
+        notify1 "$comp NOT Running!  $compcount occurrences should be $cond $occur"  "$comp" "$who"
+     fi
+   fi
+}
+
+##########################
+#  LOG checking
+##########################
+LOG_FN()
+{
+   reccount=`grep -e "$comp|$index" $DIR/allthings | tail -1 |awk '{print $1}' |tr -d ' '`
+   name=`grep -e "$comp|$index" $DIR/allthings | tail -1 |awk -F: '{print $2}'`
+   if [ "$reccount" = "" ]; then
+      reccount=0
+   fi
+   echo "Reccount for $comp $name index $index is $reccount"
+#      echo "Index for $comp is $index"
+   if [ $index -eq 1 ]; then
+      if [ $reccount -$cond $occur ]; then
+         echo $comp $name over the limit!  Count is $reccount
+         echo I need to page $who
+         notify1 "$name over $occur!  Count is $reccount"  "$comp - $name DOWN" "$who"
+      fi
+   else
+      if [ $index -eq 2 ]; then
+         if [ $reccount -$cond $occur ]; then
+            echo $comp $name under the limit!  Count is $reccount
+            echo I need to page $who
+            notify1 "$name equals $occur!  Count is $reccount"  "$comp - $name DOWN" "$who"
+         fi
+      fi 
+   fi
+}
+
+#################################
+#  Server Request Manager checking
+#################################
+SRM_FN()
+{
+   reccount=`grep -e "$comp" $DIR/allthings | tail -1 |awk '{print $1}' |tr -d ' ' `
+   if [ "$reccount" = "" ]; then
+      reccount=0
+   fi
+   echo "Reccount for $comp is $reccount"
+   case $comp in
+      "DOC_GEN_STAT_CD")
+         if [ $reccount -$cond $occur ]; then
+            echo $comp over the limit!  Count is $reccount
+            echo I need to page $who
+            notify1 "$comp over $occur!  Count is $reccount.  Check WINWORD on DOC srvr"  "$comp" "$who"
+         fi
+         ;;
+      "SRMERROR")
+         if [ $reccount -$cond $occur ]; then
+            echo $comp over the limit!  Count is $reccount
+            echo I need to page $who
+            notify1 "$comp over $occur!  Count is $reccount"  "$comp" "$who"
+         fi
+         ;;
+      "SRMQUEUED")
+         if [ $reccount -$cond $occur ]; then
+            echo $comp over the limit!  Count is $reccount
+            echo I need to page $who
+            notify1 "$comp over $occur!  Count is $reccount"  "$comp" "$who"
+         fi
+         ;;
+      "SRMSUCCESS")
+         if [ $reccount -$cond $occur ]; then
+            echo $comp under the limit!  Count is $reccount
+            echo I need to page $who
+            notify1 "$comp under $occur!  Count is $reccount"  "$comp" "$who"
+         fi
+   esac
+}
+
+###########################
+#  e-mail checking
+###########################
+EMAIL_FN()
+{
+   emaillimit=10
+   reccount=`grep -e "$comp" $DIR/allthings | tail -1 |awk '{print $1}' |tr -d ' ' `
+   if [ "$reccount" = "" ]; then
+      reccount=0
+   fi
+   echo "Reccount for $comp is $reccount"
+   if [ $reccount -gt $emaillimit ]; then
+      echo $comp over the limit!
+      echo I need to page $who
+      notify1 "$comp over $emaillimit!"  "$comp" "$who"
+   fi
+}
+
+###########################
+#  TASK count checking
+###########################
+TASK_FN()
+{
+  line=0
+  echo Checking for $occur running $comp on $srvr"\c"
+  line=`grep -we "$comp" $DIR/allthings|grep -we "$srvr"`
+
+  echo $line|awk '{print $imp}' imp=$index|read count
+
+  if [ $count -$cond $occur ]; then
+    echo "... Tasks $cond threshold @ $count"
+  else
+    echo "... Task count:  $count running should be $cond $occur"
+    echo I need to page $who
+    notify1 "$comp on $srvr Task count bad!  $count running should be $cond $occur"  "$comp on $srvr" "$who"
+  fi
+}
+
+###########################
+#  Process count checking
+###########################
+PROC_FN()
+{
+  count=0
+  echo Checking for $occur process $comp on $srvr"\c"
+  count=`ssh -n beep@$srvr ps -ef|grep -v grep|grep -c $comp`
+#echo ""
+#echo $count
+#echo ""
+  if [ $count -$cond $occur ]; then
+    echo "... Processes $cond threshold @ $count"
+  else
+    echo "... Processes:  $count should be $cond $occur"
+    echo I need to page $who
+    notify1 "$comp process count wrong!  $count occurances should be $cond $occur"  "$comp on $srvr" " $who"
+  fi
+}
+
+#####   End function definitions   #####
+#----------------------------------------
+#####       Start Mainline         #####
+
+echo " "
+date 
+
+curdow=`date +%w`
+curhour=`date +%H`
+curmin=`date +%M`
+#echo Curdow is $curdow, Curhour is $curhour, Curmin is $curmin
+#############
+# Heartbeat
+#############
+if [ $curhour -eq 12 -a $curmin -eq 00 ]; then
+      notify1 "Hello from Beep"  "BEEP" "hellobeep"
+      echo "Heartbeat"
+fi
+
+##########################
+#  Start allthings setup
+##########################
+rm -f $DIR/allthings
+#################################
+#  Generate Siebel Server lists
+#################################
+srvrmgr /g rilpros7gw01 /e siebelpro /u sadmin /p hummer2006 /c "list task" > $DIR/allthings
+srvrmgr /g rilpros7gw01 /e siebelpro /u sadmin /p hummer2006 /c "list comp" >> $DIR/allthings
+count=`grep -e "SV_NAME" $DIR/allthings| wc -l|tr -d ' '  `
+echo "Server check count is: " $count
+if [ $count -ne 2 ]; then
+   grep -E "ADM-02044|ADM-02049" $DIR/allthings
+   if [ $? -eq 0 ]; then
+      notify1 "SRVRMGR seems to be down" "SRVRMGR" "SiebelSupport"
+   fi
+   echo "SRVRMGR seems to be down"
+   cp $DIR/allthings $DIR/log_history/allthings$$
+   exit
+fi
+echo "\n" >> $DIR/allthings
+
+#############################
+#  Perform Siebel DB queries
+#############################
+db2 change sqlisl to ur > /dev/null 2>&1
+db2 connect to siebpro user sadmin using hummer2006 >/dev/null 2>&1
+#db2 connect to gmsc_mof user sadmin using sadmin >/dev/null 2>&1
+#  Since there are duplicate entires have to concatenate a sequence number
+#  to the rule ID for testing later.  This is the index variable in the 
+#  checklist.
+
+#  Number of active tasks
+#db2 +w select "count(*), concat(rule_id,'|1') from siebel.s_escl_req group by rule_id"|grep -E "1-7134PB|1-O8L4A" >> $DIR/allthings
+db2 +w select "count(*), concat(a.rule_id,'|1'), concat(concat(':',b.name),':') from siebel.s_escl_req a inner join siebel.s_escl_rule b on a.rule_id = b.row_id group by rule_id, name"|grep -E "1-O8L4A" >> $DIR/allthings
+echo "" >> $DIR/allthings
+
+#  Number of tasks that have ended
+if [ $curdow -eq 0 -o $curdow -eq 6 ]; then
+# Saturday or Sunday run with one hour interval
+   db2 +w "select count(*), concat(a.rule_id,'|2'), concat(concat(':',b.name),':') from siebel.s_escl_log a inner join siebel.s_escl_rule b on a.rule_id = b.row_id where rule_id in ('1-7134PB') and violated_dt > current timestamp - 1 hour group by rule_id, name"|grep -E "1-7134PB" >> $DIR/allthings
+else
+# During the week run with half hour interval
+   db2 +w "select count(*), concat(a.rule_id,'|2'), concat(concat(':',b.name),':') from siebel.s_escl_log a inner join siebel.s_escl_rule b on a.rule_id = b.row_id where rule_id in ('1-7134PB') and violated_dt > current timestamp - 30 minutes group by rule_id, name"|grep -E "1-7134PB" >> $DIR/allthings
+fi
+echo "" >> $DIR/allthings
+
+#  Add Server Request Manager (SRM) prefix to status
+db2 "select count(*), concat('SRM',status) from siebel.s_srm_request where sched_start_dt > current timestamp - 1 hour group by status, 1" |grep -E "ERROR|QUEUED|SUCCESS" >> $DIR/allthings
+
+# Siebel Correspondence
+db2 "select count(*), 'DOC_GEN_STAT_CD' from siebel.S_EVT_FUL_REQ where LAST_UPD between current timestamp - 1 hour and current timestamp and DOC_GEN_STAT_CD = 'In Queue'"|grep DOC_GEN_STAT_CD >> $DIR/allthings
+
+#  E-MAIL problem -- Stu 02/06/04
+#db2 "select count(*), 'EMAIL', substr(email_recip_addr,1,32) from siebel.s_evt_act where row_id in (select bt_row_id from siebel.s_escl_log where rule_id='1-WACIZ' and violated_dt > current timestamp - 15 minutes) and todo_cd='Email - Outbound' group by substr(email_recip_addr,1,32), 1 order by 1 desc fetch first 1 rows only" |grep "EMAIL" >> $DIR/allthings
+#########################
+#  End allthings setup
+#########################
+
+##############################################
+#  Loop through checklist and perform checks
+#  This is to check tasks running on gw11
+##############################################
+while read thing
+do
+# ignore commented lines
+    echo $thing | grep "^#" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+      continue
+    fi
+
+#Check time date here from line read in- if then
+#component|condition|occurrences|index|day of week|hour|notify
+#Business Integration Batch Manager|eq|8|1|1-6|06-23|csears@us.ibm.com
+    comp=`echo $thing|cut -d'|' -f1`
+    cond=`echo $thing|cut -d'|' -f2`
+    occur=`echo $thing|cut -d'|' -f3`
+    index=`echo $thing|cut -d'|' -f4`
+    dow=`echo $thing|cut -d'|' -f5`
+    hour=`echo $thing|cut -d'|' -f6`
+    who=`echo $thing|cut -d'|' -f7`
+#echo comp is $comp
+#echo index is $index
+
+# check the day of week and hour parameters
+   parmcheck
+
+   if [ "$daycheck" = "true" -a "$hourcheck" = "true" ]; then
+      case "$comp" in
+         "1-7134PB") LOG_FN ;;
+         "1-O8L4A") LOG_FN ;;
+         "1-B9M")   LOG_FN ;;
+         "SRMSUCCESS")   SRM_FN ;;
+         "SRMQUEUED")   SRM_FN ;;
+         "SRMERROR")   SRM_FN ;;
+         "DOC_GEN_STAT_CD")   SRM_FN ;;
+         "EMAIL")   EMAIL_FN ;;
+         *)         SRVRMGR_FN ;;
+      esac
+   fi
+done < $DIR/checklist
+
+##############################################
+#  Loop through checktask and perform checks
+#  This checks tasks that run on OMs
+#  New 7.7 code
+##############################################
+while read thing
+do
+# ignore commented lines
+    echo $thing | grep "^#" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+      continue
+    fi
+
+#Check time date here from line read in- if then
+#server name|component|condition|occurrences|index|day of week|hour|notify
+#Business Integration Batch Manager|eq|8|1|1-6|06-23|csears@us.ibm.com
+    srvr=`echo $thing|cut -d'|' -f1`
+    comp=`echo $thing|cut -d'|' -f2`
+    cond=`echo $thing|cut -d'|' -f3`
+    occur=`echo $thing|cut -d'|' -f4`
+    index=`echo $thing|cut -d'|' -f5`
+    dow=`echo $thing|cut -d'|' -f6`
+    hour=`echo $thing|cut -d'|' -f7`
+    who=`echo $thing|cut -d'|' -f8`
+#echo comp is $comp
+#echo index is $index
+
+# check the day of week and hour parameters
+   parmcheck
+
+   if [ "$daycheck" = "true" -a "$hourcheck" = "true" ]; then
+      case "$comp" in
+         *) TASK_FN ;;
+      esac
+   fi
+done < $DIR/checktask
+
+##############################################
+#  Loop through checktask and perform checks
+#  This checks processes on the OMs
+#  New 7.7 code
+##############################################
+while read thing
+do
+# ignore commented lines
+    echo $thing | grep "^#" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+      continue
+    fi
+
+#Check time date here from line read in- if then
+#server name|component|condition|occurances|index|day of week|hour|notify
+#rilprops7om11|edqsrv|eq|1|1|1-6|06-23|csears@us.ibm.com
+    srvr=`echo $thing|cut -d'|' -f1`
+    comp=`echo $thing|cut -d'|' -f2`
+    cond=`echo $thing|cut -d'|' -f3`
+    occur=`echo $thing|cut -d'|' -f4`
+    index=`echo $thing|cut -d'|' -f5`
+    dow=`echo $thing|cut -d'|' -f6`
+    hour=`echo $thing|cut -d'|' -f7`
+    who=`echo $thing|cut -d'|' -f8`
+#echo comp is $comp
+#echo index is $index
+
+   parmcheck
+
+   if [ "$daycheck" = "true" -a "$hourcheck" = "true" ]; then
+      case "$comp" in
+         *)   PROC_FN ;;
+      esac
+   fi
+done < $DIR/checkprocess
